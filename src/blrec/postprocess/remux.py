@@ -132,7 +132,7 @@ def remux_video(
                     # ISO_IEC_14496-10_2020(E)
                     # Table 7-1 – NAL unit type codes, syntax element categories, and NAL unit type classes  # noqa
                     # 7.4.2.7 Filler data RBSP semantics
-                    cmd += ' -bsf:v filter_units=remove_types=12'
+                    cmd += ' -bsf:v filter_units=remove_types=12|38 -reset_timestamps 1'
                 cmd += f' "{out_path}" -y'
 
                 args = shlex.split(cmd)
