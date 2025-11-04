@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Optional, Union
 
 import attr
+from loguru import logger
 from reactivex import Observable, abc
 from reactivex.disposable import CompositeDisposable, Disposable, SerialDisposable
 
@@ -41,10 +42,25 @@ class Analyser:
         self._video_height: int = 0
 
     def _on_profile_updated(self, profile: StreamProfile) -> None:
-        video_profile = profile['streams'][0]
-        assert video_profile['codec_type'] == 'video'
-        self._video_width = video_profile['width']
-        self._video_height = video_profile['height']
+        streams = profile.get('streams', [])
+        video_profiles = [s for s in streams if s.get('codec_type') == 'video']
+        audio_profiles = [s for s in streams if s.get('codec_type') == 'audio']
+
+        if video_profiles:
+            vp = video_profiles[0]
+            self._video_width = vp.get('width', 0)
+            self._video_height = vp.get('height', 0)
+        else:
+            self._video_width = 0
+            self._video_height = 0
+
+        if audio_profiles:
+            ap = audio_profiles[0]
+            self._audio_sample_rate = ap.get('sample_rate', None)
+            self._audio_channels = ap.get('channels', None)
+        else:
+            self._audio_sample_rate = None
+            self._audio_channels = None
 
     def make_metadata(self) -> MetaData:
         return MetaData(
