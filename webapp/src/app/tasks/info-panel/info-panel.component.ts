@@ -65,10 +65,27 @@ export class InfoPanelComponent implements OnInit, OnDestroy {
   ngOnDestroy(): void {
     this.desyncData();
   }
+  //新增内容:全面二压标签显示
+  getQualitySuffix(): string {
+    const num = this.data.task_status.real_quality_number;
+    if (num == null) {
+      return '';
+    }
 
-  isBlurayStreamQuality(): boolean {
-    return /_bluray/.test(this.data.task_status.stream_url);
+    const url = this.data.task_status.stream_url;
+    const tagsList = [
+      '_4000', '_2500', '_1500', '_800',
+      '_bluray', '_prohevc', '_hevc', '_minihevc',
+      '_proav1', '_av1', '_miniav1', '_uhd', '_maxhdr'
+    ];
+    // 找出 URL 中出现的标签，并去掉前导下划线
+    const found = tagsList
+      .filter(tag => new RegExp(`${tag}(?![A-Za-z0-9])`).test(url))
+      .map(tag => tag.substring(1));
+
+    return ` (${num}${found.length ? ', ' + found.join(', ') : ''})`;
   }
+
 
   closePanel(event: Event): void {
     event.preventDefault();
