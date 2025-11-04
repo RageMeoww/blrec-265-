@@ -69,20 +69,17 @@
           }}
         </span>
         <span>
-          {{
+          {{ 
             data.task_status.real_quality_number
               ? (data.task_status.real_quality_number | quality)
-              : "N/A"
-          }}
-          ({{ data.task_status.real_quality_number ?? "N/A"
-          }}<ng-container *ngIf="isBlurayStreamQuality()">, bluray</ng-container
-          >)
+              : 'N/A'
+          }}{{ getQualitySuffix() }}
         </span>
       </span>
     </li>
-    <li class="info-item" *ngIf="profile.streams[0]?.tags?.encoder">
-      <span class="label">流编码器</span>
-      <span class="value">{{ profile.streams[0].tags?.encoder }}</span>
+    <li class="info-item">
+    <span class="label">流编码器</span>
+    <span class="value">{{ profile.streams[0].tags?.encoder }}</span>
     </li>
     <li class="info-item">
       <span class="label">流主机名</span
