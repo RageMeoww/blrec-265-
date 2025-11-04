@@ -248,7 +248,7 @@ class StreamRecorder(
                 )
                 stream_format = 'fmp4'
             self.hls_stream_available_time = self.stream_available_time
-        else:
+        '''else:
             if stream_format == 'fmp4':
                 self._logger.info('Waiting for the fmp4 stream becomes available...')
                 available = await self._wait_fmp4_stream()
@@ -264,6 +264,7 @@ class StreamRecorder(
                         'falling back to stream format (flv).'
                     )
                     stream_format = 'flv'
+                    '''
 
         self._change_impl(stream_format)
         await self._impl.start()
@@ -289,7 +290,8 @@ class StreamRecorder(
     async def on_stream_recording_completed(self) -> None:
         await self._emit('stream_recording_completed')
 
-    async def _wait_fmp4_stream(self) -> bool:
+    '''async def _wait_fmp4_stream(self) -> bool:
+        return False
         end_time = time.monotonic() + self.fmp4_stream_timeout
         available = False  # debounce
         while True:
@@ -304,7 +306,7 @@ class StreamRecorder(
                     return True
                 else:
                     available = True
-            await asyncio.sleep(1)
+            await asyncio.sleep(1)'''
 
     def _change_impl(self, stream_format: StreamFormat) -> None:
         if stream_format == 'flv':
