@@ -36,6 +36,7 @@ _LIVE_STATUS_PATTERN = re.compile(rb'"live_status"\s*:\s*(\d)')
 
 class Live:
     def __init__(self, room_id: int, user_agent: str = '', cookie: str = '') -> None:
+        self._last_request_time = 0.0
         self._logger = logger.bind(room_id=room_id)
 
         self._room_id = room_id
@@ -273,14 +274,23 @@ class Live:
         return extract_streams(play_infos)
 
     async def get_live_stream_url(
-        self,
-        qn: QualityNumber = 10000,
-        *,
-        api_platform: ApiPlatform = 'web',
-        stream_format: StreamFormat = 'flv',
-        stream_codec: StreamCodec = 'avc',
-        select_alternative: bool = False,
+            self,
+            qn: QualityNumber = 10000,
+            *,
+            api_platform: ApiPlatform = 'web',
+            stream_format: StreamFormat = 'flv',
+            stream_codec: StreamCodec = 'avc',
+            select_alternative: bool = False,
     ) -> str:
+        now = time.monotonic()
+        elapsed = now - self._last_request_time
+        #调整请求频率，最高5秒一次
+        if elapsed < 5:
+            time.sleep(5 - elapsed)
+
+        # 更新上次请求时间
+        self._last_request_time = time.monotonic()
+        self._logger.warning(f'调用请求函数')
         streams = await self.get_live_streams(qn, api_platform=api_platform)
         if not streams:
             raise NoStreamAvailable(stream_format, stream_codec, qn)
@@ -289,53 +299,67 @@ class Live:
         if not formats:
             raise NoStreamFormatAvailable(stream_format, stream_codec, qn)
 
-        codecs = extract_codecs(formats, stream_codec)
-        if not codecs:
-            raise NoStreamCodecAvailable(stream_format, stream_codec, qn)
-
         if stream_format == 'fmp4':
-            hevc_codecs = extract_codecs(formats, 'hevc')
-            avc_codecs = extract_codecs(formats, 'avc')
-            # 如果 codecs 为空，使用默认值
-            if not hevc_codecs:
-                hevc_codecs = []
-            if not avc_codecs:
-                avc_codecs = []
-            hevc_current_qn = [item.get('current_qn') for item in hevc_codecs if item.get('current_qn') is not None]
-            avc_current_qn = [item.get('current_qn') for item in avc_codecs if item.get('current_qn') is not None]
-
-            if 10000 in avc_current_qn:
-                codecs = avc_codecs
-            elif 10000 in hevc_current_qn:
-                codecs = hevc_codecs
-
-            # 按主机排序，优先选择 'gotcha201' 到 'gotcha208' 的主机，数字越小优先级越高
             def sort_by_host(info: Any) -> int:
-                host = info['host']
-                if match := re.search(r'gotcha(\d+)', host):
-                    num = int(match.group(1))
-                    if 201 <= num <= 208:  # 只处理 gotcha201 到 gotcha208
-                        return num  # 数字越小，优先级越高
+                if m := re.search(r'gotcha(\d+)', info['host']):
+                    n = int(m.group(1))
+                    if 201 <= n <= 208:
+                        return n
                 return 1000
 
-            # 排序后的 url 信息
+            # 直接遍历 formats -> 每个 format['codec'] -> 每个 codec['url_info']
             url_infos = sorted(
-                ({**i, 'base_url': c['base_url']} for c in codecs for i in c['url_info']),
+                (
+                    {**ui, 'base_url': c['base_url']}
+                    for fmt in formats
+                    for c in fmt.get('codec', [])
+                    for ui in c.get('url_info', [])
+                ),
                 key=sort_by_host,
             )
             urls = [i['host'] + i['base_url'] + i['extra'] for i in url_infos]
+
+            # 只有 qn==10000 时才执行过滤逻辑，过滤请求qn为10000时依然返回的其他画质链接
+            if qn == 10000:
+                # 检查不支持的质量标签，并在日志中打印这种情况下的原始请求
+                for u in urls:
+                    if any(tag in u for tag in ("_4000", "_2500", "_1500", "_800")):
+                        self._logger.debug(f"链接出现_4000/2500/1500/800，原始请求：{streams}")
+
+                # 分组：优先真原画，其次prohevc，再次bluray
+                exclude = ["_bluray", "_prohevc", "_hevc", "_minihevc", "_proav1", "_av1", "_miniav1"\
+,"_4000", "_2500", "_1500", "_800"]
+                pref = [u for u in urls if all(tag not in u for tag in exclude)]
+                prov = [u for u in urls if "_prohevc" in u]
+                blur = [u for u in urls if "_bluray" in u]
+                av1 = [u for u in urls if "_proav1" in u]
+
+                if pref:
+                    candidates = pref
+                elif prov:
+                    candidates = prov
+                elif blur:
+                    candidates = blur
+                elif av1:
+                    self._logger.debug(f'选中_proav1，几乎不可能的事情发生，原始请求:{streams}')
+                    candidates = av1
+                else:
+                    raise NoStreamQualityAvailable("if_fmp4内部逻辑1", stream_format, stream_codec, qn)
+
+                urls = candidates
+
+            if not urls:
+                raise NoStreamQualityAvailable("if_fmp4内部逻辑2", stream_format, stream_codec, qn)
+
             if not select_alternative:
                 return urls[0]
-
-            try:
+            else:
                 return urls[1]
-            except IndexError:
-                raise NoAlternativeStreamAvailable(stream_format, stream_codec, qn)
 
-        accept_qns = jsonpath(codecs, '$[*].accept_qn[*]')
-        current_qns = jsonpath(codecs, '$[*].current_qn')
-        if qn not in accept_qns or not all(map(lambda q: q == qn, current_qns)):
-            raise NoStreamQualityAvailable(stream_format, stream_codec, qn)
+        # 非 fmp4 保持原有逻辑
+        codecs = extract_codecs(formats, stream_codec)
+        if not codecs:
+            raise NoStreamCodecAvailable(stream_format, stream_codec, qn)
 
         def sort_by_host(info: Any) -> int:
             host = info['host']
@@ -364,6 +388,13 @@ class Live:
             key=sort_by_host,
         )
         urls = [i['host'] + i['base_url'] + i['extra'] for i in url_infos]
+
+        # 只有 qn==10000 时才执行打印逻辑，打印请求qn为10000时依然返回的其他画质链接
+        if qn == 10000:
+            # 检查不支持的质量标签，并在日志中打印这种情况下的原始请求
+            for u in urls:
+                if any(tag in u for tag in ("_4000", "_2500", "_1500", "_800")):
+                    self._logger.debug(f"链接出现_4000/2500/1500/800，原始请求：{streams}")
 
         if not select_alternative:
             return urls[0]
