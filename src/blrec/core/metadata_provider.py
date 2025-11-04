@@ -24,6 +24,21 @@ class MetadataProvider:
         return self._make_metadata(original_metadata)
 
     def _make_metadata(self, original_metadata: Dict[str, Any]) -> Dict[str, Any]:
+        profile = original_metadata or {}
+
+        encoder = profile.get('encoder', '')
+        if encoder:
+            encoder = encoder.rstrip('\x00')
+
+        else:
+            video = next(
+                (s for s in profile.get('streams', []) if s.get('codec_type') == 'video'),
+                {}
+            )
+            encoder = video.get('tags', {}).get('encoder', '')
+
+            if not encoder:
+                encoder = profile.get('format', {}).get('tags', {}).get('encoder', '')
         tz = timezone(timedelta(hours=8))
         live_start_time = datetime.fromtimestamp(
             self._live.room_info.live_start_time, tz
@@ -48,19 +63,32 @@ class MetadataProvider:
             )
 
         assert self._stream_recorder.real_quality_number is not None
-        stream_quality = '{} ({}{})'.format(
+
+        # 要支持的所有后缀标签（包含下划线）
+        tags = [
+            "_4000", "_2500", "_1500", "_800",
+            "_bluray", "_prohevc", "_hevc", "_minihevc",
+            "_proav1", "_av1", "_miniav1", "_uhd", "_maxhdr"
+        ]
+
+        url = self._stream_recorder.stream_url
+        # 找出 URL 中出现的标签，并去掉前导下划线
+        found = [tag.lstrip('_') for tag in tags if tag in url]
+
+        # 生成标签后缀字符串，如 ", bluray, hevc"
+        suffix = f", {', '.join(found)}" if found else ""
+
+        stream_quality = "{} ({}{})".format(
             get_quality_name(self._stream_recorder.real_quality_number),
             self._stream_recorder.real_quality_number,
-            ', bluray' if '_bluray' in self._stream_recorder.stream_url else '',
+            suffix,
         )
-        if '_prohevc' in self._stream_recorder.stream_url:
-            stream_quality = stream_quality.replace(')', ', prohevc)')
-
-        return {
-            'Title': self._live.room_info.title,
-            'Artist': self._live.user_info.name,
-            'Date': str(live_start_time),
-            'Comment': f'''\
+        if profile == {}:
+            return {
+    'Title': self._live.room_info.title,
+    'Artist': self._live.user_info.name,
+    'Date': str(live_start_time),
+    'Comment': f'''\
 B站直播录像
 主播：{self._live.user_info.name}
 标题：{self._live.room_info.title}
@@ -74,22 +102,65 @@ HLS流可用时间: {hls_stream_available_time}
 流格式：{self._stream_recorder.stream_format}
 流画质：{stream_quality}
 录制程序：{__prog__} v{__version__} {__github__}''',
-            'description': OrderedDict(
-                {
-                    'UserId': str(self._live.user_info.uid),
-                    'UserName': self._live.user_info.name,
-                    'RoomId': str(self._live.room_info.room_id),
-                    'RoomTitle': self._live.room_info.title,
-                    'Area': self._live.room_info.area_name,
-                    'ParentArea': self._live.room_info.parent_area_name,
-                    'LiveStartTime': str(live_start_time),
-                    'StreamAvailableTime': str(stream_available_time),
-                    'HLSStreamAvailableTime': str(hls_stream_available_time),
-                    'RecordStartTime': str(record_start_time),
-                    'StreamHost': self._stream_recorder.stream_host,
-                    'StreamFormat': self._stream_recorder.stream_format,
-                    'StreamQuality': stream_quality,
-                    'Recorder': f'{__prog__} v{__version__} {__github__}',
-                }
-            ),
+    'description': OrderedDict(
+        {
+            'UserId': str(self._live.user_info.uid),
+            'UserName': self._live.user_info.name,
+            'RoomId': str(self._live.room_info.room_id),
+            'RoomTitle': self._live.room_info.title,
+            'Area': self._live.room_info.area_name,
+            'ParentArea': self._live.room_info.parent_area_name,
+            'LiveStartTime': str(live_start_time),
+            'StreamAvailableTime': str(stream_available_time),
+            'HLSStreamAvailableTime': str(hls_stream_available_time),
+            'RecordStartTime': str(record_start_time),
+            'StreamHost': self._stream_recorder.stream_host,
+            'StreamFormat': self._stream_recorder.stream_format,
+            'StreamQuality': stream_quality,
+            'Recorder': f'{__prog__} v{__version__} {__github__}',
         }
+    ),
+}
+
+        else:
+            return {
+    'Title': self._live.room_info.title,
+    'Artist': self._live.user_info.name,
+    'Date': str(live_start_time),
+    'Comment': f'''\
+B站直播录像
+主播：{self._live.user_info.name}
+标题：{self._live.room_info.title}
+分区：{self._live.room_info.parent_area_name} - {self._live.room_info.area_name}
+房间号：{self._live.room_info.room_id}
+开播时间：{live_start_time}
+开始推流时间: {stream_available_time}
+HLS流可用时间: {hls_stream_available_time}
+录播起始时间: {record_start_time}
+流主机: {self._stream_recorder.stream_host}
+流格式：{self._stream_recorder.stream_format}
+流画质：{stream_quality}
+原始流编码器：{encoder}
+录制程序：{__prog__} v{__version__} {__github__}''',
+    'description': OrderedDict(
+        {
+            'UserId': str(self._live.user_info.uid),
+            'UserName': self._live.user_info.name,
+            'RoomId': str(self._live.room_info.room_id),
+            'RoomTitle': self._live.room_info.title,
+            'Area': self._live.room_info.area_name,
+            'ParentArea': self._live.room_info.parent_area_name,
+            'LiveStartTime': str(live_start_time),
+            'StreamAvailableTime': str(stream_available_time),
+            'HLSStreamAvailableTime': str(hls_stream_available_time),
+            'RecordStartTime': str(record_start_time),
+            'StreamHost': self._stream_recorder.stream_host,
+            'StreamFormat': self._stream_recorder.stream_format,
+            'StreamQuality': stream_quality,
+            'OriginalEncoder': encoder,
+            'Recorder': f'{__prog__} v{__version__} {__github__}',
+        }
+    ),
+}
+
+
