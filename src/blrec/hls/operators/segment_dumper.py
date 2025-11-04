@@ -81,53 +81,47 @@ class SegmentDumper:
         )
 
     def _must_split_file(
-        self, prev_init_item: Optional[InitSectionData], curr_init_item: InitSectionData
+            self, prev_init_item: Optional[InitSectionData], curr_init_item: InitSectionData
     ) -> bool:
-        if prev_init_item is None:
+        # 如果根本没旧段，或旧段没有 payload，都当“第一次处理”
+        if not prev_init_item or not getattr(prev_init_item, 'payload', None):
             curr_profile = ffprobe(curr_init_item.payload)
-            logger.debug(f'current init section profile: {curr_profile}')
+            #logger.debug(f'current init section profile: {curr_profile}')
             return True
 
+        # 至此可以安全用 prev_init_item.payload 了
         prev_profile = ffprobe(prev_init_item.payload)
         logger.debug(f'previous init section profile: {prev_profile}')
         curr_profile = ffprobe(curr_init_item.payload)
         logger.debug(f'current init section profile: {curr_profile}')
 
-        if prev_init_item.payload == curr_init_item.payload:
-            logger.debug('the current init section is identical to the previous one')
-            return False
+        # 用列表推导分别找 video 和 audio
+        prev_video = next((s for s in prev_profile['streams'] if s.get('codec_type') == 'video'), None)
+        curr_video = next((s for s in curr_profile['streams'] if s.get('codec_type') == 'video'), None)
+        prev_audio = next((s for s in prev_profile['streams'] if s.get('codec_type') == 'audio'), None)
+        curr_audio = next((s for s in curr_profile['streams'] if s.get('codec_type') == 'audio'), None)
 
-        prev_video_profile = prev_profile['streams'][0]
-        prev_audio_profile = prev_profile['streams'][1]
-        assert prev_video_profile['codec_type'] == 'video'
-        assert prev_audio_profile['codec_type'] == 'audio'
-
-        curr_video_profile = curr_profile['streams'][0]
-        curr_audio_profile = curr_profile['streams'][1]
-        assert curr_video_profile['codec_type'] == 'video'
-        assert curr_audio_profile['codec_type'] == 'audio'
-
+        # 只有都存在才比较
+        if prev_audio and curr_audio:
+            if (
+                    prev_audio['codec_name'] != curr_audio['codec_name']
+                    or prev_audio['channels'] != curr_audio['channels']
+                    or prev_audio['sample_rate'] != curr_audio['sample_rate']
+                    or prev_audio.get('bit_rate') != curr_audio.get('bit_rate')
+            ):
+                logger.warning('Audio parameters changed')
+        else:
+            logger.debug('至少有一个段没有音轨，跳过音频比较')
+        # video 参数比较维持原样
         if (
-            prev_video_profile['codec_name'] != curr_video_profile['codec_name']
-            or prev_video_profile['width'] != curr_video_profile['width']
-            or prev_video_profile['height'] != curr_video_profile['height']
-            or prev_video_profile['coded_width'] != curr_video_profile['coded_width']
-            or prev_video_profile['coded_height'] != curr_video_profile['coded_height']
+                prev_video['codec_name'] != curr_video['codec_name']
+                or prev_video['width'] != curr_video['width']
+                or prev_video['height'] != curr_video['height']
+                or prev_video['coded_width'] != curr_video['coded_width']
+                or prev_video['coded_height'] != curr_video['coded_height']
         ):
             logger.warning('Video parameters changed')
 
-        if (
-            prev_audio_profile['codec_name'] != curr_audio_profile['codec_name']
-            or prev_audio_profile['channels'] != curr_audio_profile['channels']
-            or prev_audio_profile['sample_rate'] != curr_audio_profile['sample_rate']
-            or prev_audio_profile.get('bit_rate') != curr_audio_profile.get('bit_rate')
-        ):
-            logger.warning('Audio parameters changed')
-
-        logger.debug(
-            'must split the file '
-            'because the current init section is not identical to the previous one'
-        )
         return True
 
     def _need_split_file(self, item: Union[InitSectionData, SegmentData]) -> bool:
