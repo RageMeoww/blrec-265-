@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from loguru import logger
 from subprocess import PIPE, Popen
 from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
 
@@ -100,11 +101,13 @@ def ffprobe(data: bytes) -> StreamProfile:
         try:
             stdout, _stderr = process.communicate(data, timeout=10)
             profile = json.loads(stdout)
-        except Exception:
+        except BaseException as e:
+            logger.warning(f'[调试] ffprobe 报错: {type(e)} -> {e}')
             process.kill()
             process.wait()
             raise
         else:
+            profile = normalize_streams(profile)
             return profile
 
 
@@ -119,6 +122,7 @@ def ffprobe_on(data: bytes) -> Observable[StreamProfile]:
             try:
                 profile = ffprobe(data)
             except Exception as e:
+                logger.debug(f"[调试] ffprobe异常: {e}")
                 observer.on_error(e)
             else:
                 observer.on_next(profile)
@@ -127,3 +131,84 @@ def ffprobe_on(data: bytes) -> Observable[StreamProfile]:
         return _scheduler.schedule(action)
 
     return Observable(subscribe)
+
+
+def normalize_streams(profile: dict) -> dict:
+    streams = profile.get('streams', [])
+    video_streams = [s for s in streams if s.get('codec_type') == 'video']
+    audio_streams = [s for s in streams if s.get('codec_type') == 'audio']
+
+    # ✨ 若 format 中有 encoder，则补到第一个视频流的 tags 中
+    encoder = profile.get('format', {}).get('tags', {}).get('encoder')
+    if video_streams and encoder:
+        video_stream = video_streams[0]
+        if 'tags' not in video_stream:
+            video_stream['tags'] = {}
+        if 'encoder' not in video_stream['tags']:
+            video_stream['tags']['encoder'] = encoder
+
+    if not video_streams:
+        video_streams.append({
+            'codec_type': 'video',
+            'codec_name': 'none',
+            'width': 0,
+            'height': 0,
+            'index': -1,
+            'codec_long_name': '',
+            'codec_tag_string': '',
+            'codec_tag': '',
+            'coded_width': 0,
+            'coded_height': 0,
+            'closed_captions': 0,
+            'film_grain': 0,
+            'has_b_frames': 0,
+            'level': 0,
+            'refs': 0,
+            'is_avc': '',
+            'nal_length_size': '',
+            'id': '',
+            'r_frame_rate': '',
+            'avg_frame_rate': '',
+            'time_base': '',
+            'duration_ts': 0,
+            'duration': '',
+            'extradata_size': 0,
+            'disposition': {},
+            'tags': {},
+        })
+    if not audio_streams:
+        audio_streams.append({
+            'codec_type': 'audio',
+            'codec_name': 'none',
+            'sample_fmt': '',
+            'sample_rate': '0',
+            'channels': 0,
+            'channel_layout': '',
+            'bits_per_sample': 0,
+            'index': -1,
+            'codec_long_name': '',
+            'codec_tag_string': '',
+            'codec_tag': '',
+            'id': '',
+            'r_frame_rate': '',
+            'avg_frame_rate': '',
+            'time_base': '',
+            'duration_ts': 0,
+            'duration': '',
+            'bit_rate': '',
+            'extradata_size': 0,
+            'disposition': {},
+            'tags': {},
+        })
+
+    # 交替合并
+    merged = []
+    max_len = max(len(video_streams), len(audio_streams))
+    for i in range(max_len):
+        if i < len(video_streams):
+            merged.append(video_streams[i])
+        if i < len(audio_streams):
+            merged.append(audio_streams[i])
+
+    profile['streams'] = merged
+    return profile
