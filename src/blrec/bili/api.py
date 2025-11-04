@@ -1,341 +1,485 @@
 import asyncio
-import hashlib
+import json
+import re
 import time
-from abc import ABC
-from datetime import datetime
-from typing import Any, Dict, Final, List, Mapping, Optional
-from urllib.parse import urlencode
+from typing import Any, Dict, List
 
 import aiohttp
+from jsonpath import jsonpath
+from tenacity import retry, retry_if_exception_type, stop_after_delay, wait_exponential
+
+from .api import BASE_HEADERS, AppApi, WebApi
+from .exceptions import (
+    LiveRoomEncrypted,
+    LiveRoomHidden,
+    LiveRoomLocked,
+    NoAlternativeStreamAvailable,
+    NoStreamAvailable,
+    NoStreamCodecAvailable,
+    NoStreamFormatAvailable,
+    NoStreamQualityAvailable,
+)
+from .helpers import extract_codecs, extract_formats, extract_streams
+from .models import LiveStatus, RoomInfo, UserInfo
+from .net import connector, timeout
+from .typing import ApiPlatform, QualityNumber, ResponseData, StreamCodec, StreamFormat
+
+__all__ = ('Live',)
+
 from loguru import logger
-from tenacity import retry, stop_after_delay, wait_exponential
 
-from .exceptions import ApiRequestError
-from . import wbi
-from .typing import JsonResponse, QualityNumber, ResponseData
-
-__all__ = 'AppApi', 'WebApi'
+_INFO_PATTERN = re.compile(
+    rb'<script>\s*window\.__NEPTUNE_IS_MY_WAIFU__\s*=\s*(\{.*?\})\s*</script>'
+)
+_LIVE_STATUS_PATTERN = re.compile(rb'"live_status"\s*:\s*(\d)')
 
 
-BASE_HEADERS: Final = {
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Accept-Language': 'zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en;q=0.3,en-US;q=0.2',  # noqa
-    'Accept': 'application/json, text/plain, */*',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Origin': 'https://live.bilibili.com',
-    'Pragma': 'no-cache',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36',  # noqa
-}
+class Live:
+    def __init__(self, room_id: int, user_agent: str = '', cookie: str = '') -> None:
+        self._last_request_time = 0.0
+        self._logger = logger.bind(room_id=room_id)
 
+        self._room_id = room_id
+        self._user_agent = user_agent
+        self._cookie = cookie
+        self._update_headers()
+        self._html_page_url = f'https://live.bilibili.com/{room_id}'
 
-class BaseApi(ABC):
-    def __init__(
-        self,
-        session: aiohttp.ClientSession,
-        headers: Optional[Dict[str, str]] = None,
-        *,
-        room_id: Optional[int] = None,
-    ):
-        self._logger = logger.bind(room_id=room_id or '')
+        self._session = aiohttp.ClientSession(
+            connector=connector,
+            connector_owner=False,
+            raise_for_status=True,
+            trust_env=True,
+            timeout=timeout,
+        )
+        self._appapi = AppApi(self._session, self.headers, room_id=room_id)
+        self._webapi = WebApi(self._session, self.headers, room_id=room_id)
 
-        self.base_api_urls: List[str] = ['https://api.bilibili.com']
-        self.base_live_api_urls: List[str] = ['https://api.live.bilibili.com']
-        self.base_play_info_api_urls: List[str] = ['https://api.live.bilibili.com']
+        self._room_info: RoomInfo
+        self._user_info: UserInfo
+        self._no_flv_stream: bool
 
-        self._session = session
-        self.headers = headers or {}
-        self.timeout = 10
+    @property
+    def base_api_urls(self) -> List[str]:
+        return self._webapi.base_api_urls
+
+    @base_api_urls.setter
+    def base_api_urls(self, value: List[str]) -> None:
+        self._webapi.base_api_urls = value
+        self._appapi.base_api_urls = value
+
+    @property
+    def base_live_api_urls(self) -> List[str]:
+        return self._webapi.base_live_api_urls
+
+    @base_live_api_urls.setter
+    def base_live_api_urls(self, value: List[str]) -> None:
+        self._webapi.base_live_api_urls = value
+        self._appapi.base_live_api_urls = value
+
+    @property
+    def base_play_info_api_urls(self) -> List[str]:
+        return self._webapi.base_play_info_api_urls
+
+    @base_play_info_api_urls.setter
+    def base_play_info_api_urls(self, value: List[str]) -> None:
+        self._webapi.base_play_info_api_urls = value
+        self._appapi.base_play_info_api_urls = value
+
+    @property
+    def user_agent(self) -> str:
+        return self._user_agent
+
+    @user_agent.setter
+    def user_agent(self, value: str) -> None:
+        self._user_agent = value
+        self._update_headers()
+        self._webapi.headers = self.headers
+        self._appapi.headers = self.headers
+
+    @property
+    def cookie(self) -> str:
+        return self._cookie
+
+    @cookie.setter
+    def cookie(self, value: str) -> None:
+        self._cookie = value
+        self._update_headers()
+        self._webapi.headers = self.headers
+        self._appapi.headers = self.headers
 
     @property
     def headers(self) -> Dict[str, str]:
         return self._headers
 
-    @headers.setter
-    def headers(self, value: Dict[str, str]) -> None:
-        self._headers = {**BASE_HEADERS, **value}
-
-    @staticmethod
-    def _check_response(json_res: JsonResponse) -> None:
-        if json_res['code'] != 0:
-            raise ApiRequestError(
-                json_res['code'], json_res.get('message') or json_res.get('msg') or ''
-            )
-
-    @retry(reraise=True, stop=stop_after_delay(5), wait=wait_exponential(0.1))
-    async def _get_json_res(self, *args: Any, **kwds: Any) -> JsonResponse:
-        should_check_response = kwds.pop('check_response', True)
-        kwds = {'timeout': self.timeout, 'headers': self.headers, **kwds}
-        async with self._session.get(*args, **kwds) as res:
-            self._logger.trace('Request: {}', res.request_info)
-            self._logger.trace('Response: {}', await res.text())
-            try:
-                json_res = await res.json()
-            except aiohttp.ContentTypeError:
-                text_res = await res.text()
-                self._logger.debug(f'Response text: {text_res[:200]}')
-                raise
-            if should_check_response:
-                self._check_response(json_res)
-            return json_res
-
-    async def _get_json(
-        self, base_urls: List[str], path: str, *args: Any, **kwds: Any
-    ) -> JsonResponse:
-        if not base_urls:
-            raise ValueError('No base urls')
-        exception = None
-        for base_url in base_urls:
-            url = base_url + path
-            try:
-                return await self._get_json_res(url, *args, **kwds)
-            except Exception as exc:
-                exception = exc
-                self._logger.trace('Failed to get json from {}: {}', url, repr(exc))
-        else:
-            assert exception is not None
-            raise exception
-
-    async def _get_jsons_concurrently(
-        self, base_urls: List[str], path: str, *args: Any, **kwds: Any
-    ) -> List[JsonResponse]:
-        if not base_urls:
-            raise ValueError('No base urls')
-        urls = [base_url + path for base_url in base_urls]
-        aws = (self._get_json_res(url, *args, **kwds) for url in urls)
-        results = await asyncio.gather(*aws, return_exceptions=True)
-        exceptions = []
-        json_responses = []
-        for idx, item in enumerate(results):
-            if isinstance(item, Exception):
-                self._logger.trace(
-                    'Failed to get json from {}: {}', urls[idx], repr(item)
-                )
-                exceptions.append(item)
-            elif isinstance(item, dict):
-                json_responses.append(item)
-            else:
-                self._logger.trace('{}', repr(item))
-        if not json_responses:
-            raise exceptions[0]
-        return json_responses
-
-
-class AppApi(BaseApi):
-    # taken from https://github.com/SocialSisterYi/bilibili-API-collect/blob/master/other/API_sign.md  # noqa
-    _appkey = '1d8b6e7d45233436'
-    _appsec = '560c52ccd288fed045859ed18bffd973'
-
-    _app_headers = {
-        'User-Agent': 'Mozilla/5.0 BiliDroid/6.64.0 (bbcallen@gmail.com) os/android model/Unknown mobi_app/android build/6640400 channel/bili innerVer/6640400 osVer/6.0.1 network/2',  # noqa
-        'Connection': 'Keep-Alive',
-        'Accept-Encoding': 'gzip',
-    }
-
-    @property
-    def headers(self) -> Dict[str, str]:
-        return self._headers
-
-    @headers.setter
-    def headers(self, value: Dict[str, str]) -> None:
-        self._headers = {**value, **self._app_headers}
-
-    @classmethod
-    def signed(cls, params: Mapping[str, Any]) -> Dict[str, Any]:
-        if isinstance(params, Mapping):
-            params = dict(sorted({**params, 'appkey': cls._appkey}.items()))
-        else:
-            raise ValueError(type(params))
-        query = urlencode(params, doseq=True)
-        sign = hashlib.md5((query + cls._appsec).encode()).hexdigest()
-        params.update(sign=sign)
-        return params
-
-    async def get_room_play_infos(
-        self,
-        room_id: int,
-        qn: QualityNumber = 10000,
-        *,
-        only_video: bool = False,
-        only_audio: bool = False,
-    ) -> List[ResponseData]:
-        path = '/xlive/app-room/v2/index/getRoomPlayInfo'
-        params = self.signed(
-            {
-                'actionKey': 'appkey',
-                'build': '6640400',
-                'channel': 'bili',
-                'codec': '0,1',  # 0: avc, 1: hevc
-                'device': 'android',
-                'device_name': 'Unknown',
-                'disable_rcmd': '0',
-                'dolby': '1',
-                'format': '0,1,2',  # 0: flv, 1: ts, 2: fmp4
-                'free_type': '0',
-                'http': '1',
-                'mask': '0',
-                'mobi_app': 'android',
-                'need_hdr': '0',
-                'no_playurl': '0',
-                'only_audio': '1' if only_audio else '0',
-                'only_video': '1' if only_video else '0',
-                'platform': 'android',
-                'play_type': '0',
-                'protocol': '0,1',
-                'qn': qn,
-                'room_id': room_id,
-                'ts': int(datetime.utcnow().timestamp()),
-            }
-        )
-        json_responses = await self._get_jsons_concurrently(
-            self.base_play_info_api_urls, path, params=params
-        )
-        return [r['data'] for r in json_responses]
-
-    async def get_info_by_room(self, room_id: int) -> ResponseData:
-        path = '/xlive/app-room/v1/index/getInfoByRoom'
-        params = self.signed(
-            {
-                'actionKey': 'appkey',
-                'build': '6640400',
-                'channel': 'bili',
-                'device': 'android',
-                'mobi_app': 'android',
-                'platform': 'android',
-                'room_id': room_id,
-                'ts': int(datetime.utcnow().timestamp()),
-            }
-        )
-        json_res = await self._get_json(self.base_live_api_urls, path, params=params)
-        return json_res['data']
-
-    async def get_user_info(self, uid: int) -> ResponseData:
-        base_api_urls = ['https://app.bilibili.com']
-        path = '/x/v2/space'
-        params = self.signed(
-            {
-                'build': '6640400',
-                'channel': 'bili',
-                'mobi_app': 'android',
-                'platform': 'android',
-                'ts': int(datetime.utcnow().timestamp()),
-                'vmid': uid,
-            }
-        )
-        json_res = await self._get_json(base_api_urls, path, params=params)
-        return json_res['data']
-
-    async def get_danmu_info(self, room_id: int) -> ResponseData:
-        path = '/xlive/app-room/v1/index/getDanmuInfo'
-        params = self.signed(
-            {
-                'actionKey': 'appkey',
-                'build': '6640400',
-                'channel': 'bili',
-                'device': 'android',
-                'mobi_app': 'android',
-                'platform': 'android',
-                'room_id': room_id,
-                'ts': int(datetime.utcnow().timestamp()),
-            }
-        )
-        json_res = await self._get_json(self.base_live_api_urls, path, params=params)
-        return json_res['data']
-
-
-class WebApi(BaseApi):
-    _wbi_key = wbi.make_key(
-        img_key="7cd084941338484aae1ad9425b84077c",
-        sub_key="4932caff0ff746eab6f01bf08b70ac45",
-    )
-    _wbi_key_mtime = 0.0
-
-    @retry(reraise=True, stop=stop_after_delay(20), wait=wait_exponential(0.1))
-    async def _get_json_res(
-        self, url: str, with_wbi: bool = False, *args: Any, **kwds: Any
-    ) -> JsonResponse:
-        if with_wbi:
-            key = self.__class__._wbi_key
-            ts = int(datetime.now().timestamp())
-            params = list(kwds.pop("params").items())
-            query = wbi.build_query(key, ts, params)
-            url = f'{url}?{query}'
-
-        try:
-            return await super()._get_json_res(url, *args, **kwds)
-        except ApiRequestError as e:
-            if e.code == -352 and time.monotonic() - self.__class__._wbi_key_mtime > 60:
-                await self._update_wbi_key()
-            raise
-
-    async def room_init(self, room_id: int) -> ResponseData:
-        path = '/room/v1/Room/room_init'
-        params = {'id': room_id}
-        json_res = await self._get_json(self.base_live_api_urls, path, params=params)
-        return json_res['data']
-
-    async def get_room_play_infos(
-        self, room_id: int, qn: QualityNumber = 10000
-    ) -> List[ResponseData]:
-        path = '/xlive/web-room/v2/index/getRoomPlayInfo'
-        params = {
-            'room_id': room_id,
-            'protocol': '0,1',
-            'format': '0,1,2',
-            'codec': '0,1',
-            'qn': qn,
-            'platform': 'web',
-            'ptype': 8,
+    def _update_headers(self) -> None:
+        self._headers = {
+            **BASE_HEADERS,
+            'Referer': f'https://live.bilibili.com/{self._room_id}',
+            'User-Agent': self._user_agent,
+            'Cookie': self._cookie,
         }
-        json_responses = await self._get_jsons_concurrently(
-            self.base_play_info_api_urls, path, with_wbi=True, params=params
-        )
-        return [r['data'] for r in json_responses]
 
-    async def get_info_by_room(self, room_id: int) -> ResponseData:
-        path = '/xlive/web-room/v1/index/getInfoByRoom'
-        params = {'room_id': room_id}
-        json_res = await self._get_json(
-            self.base_live_api_urls, path, with_wbi=True, params=params
-        )
-        return json_res['data']
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        return self._session
 
-    async def get_info(self, room_id: int) -> ResponseData:
-        path = '/room/v1/Room/get_info'
-        params = {'room_id': room_id}
-        json_res = await self._get_json(self.base_live_api_urls, path, params=params)
-        return json_res['data']
+    @property
+    def appapi(self) -> AppApi:
+        return self._appapi
+
+    @property
+    def webapi(self) -> WebApi:
+        return self._webapi
+
+    @property
+    def room_id(self) -> int:
+        return self._room_id
+
+    @property
+    def room_info(self) -> RoomInfo:
+        return self._room_info
+
+    @property
+    def user_info(self) -> UserInfo:
+        return self._user_info
+
+    async def init(self) -> None:
+        self._room_info = await self.get_room_info()
+        self._user_info = await self.get_user_info(self._room_info.uid)
+
+        self._no_flv_stream = False
+        if self.is_living():
+            streams = await self.get_live_streams()
+            if streams:
+                flv_formats = extract_formats(streams, 'flv')
+                self._no_flv_stream = not flv_formats
+
+    async def deinit(self) -> None:
+        await self._session.close()
+
+    def has_no_flv_streams(self) -> bool:
+        return self._no_flv_stream
+
+    async def get_live_status(self) -> LiveStatus:
+        try:
+            # frequent requests will be intercepted by the server's firewall!
+            live_status = await self._get_live_status_via_api()
+        except Exception:
+            # more cpu consumption
+            live_status = await self._get_live_status_via_html_page()
+
+        return LiveStatus(live_status)
+
+    def is_living(self) -> bool:
+        return self._room_info.live_status == LiveStatus.LIVE
+
+    async def check_connectivity(self) -> bool:
+        try:
+            await self._session.head('https://live.bilibili.com/', timeout=3, headers={
+                'User-Agent': self._user_agent,
+            })
+            return True
+        except Exception as e:
+            self._logger.warning(f'Check connectivity failed: {repr(e)}')
+            return False
+
+    async def update_info(self, raise_exception: bool = False) -> bool:
+        return all(
+            await asyncio.gather(
+                self.update_user_info(raise_exception=raise_exception),
+                self.update_room_info(raise_exception=raise_exception),
+            )
+        )
+
+    async def update_user_info(self, raise_exception: bool = False) -> bool:
+        try:
+            self._user_info = await self.get_user_info(self._room_info.uid)
+        except Exception as e:
+            self._logger.error(f'Failed to update user info: {repr(e)}')
+            if raise_exception:
+                raise
+            return False
+        else:
+            return True
+
+    async def update_room_info(self, raise_exception: bool = False) -> bool:
+        try:
+            self._room_info = await self.get_room_info()
+        except Exception as e:
+            self._logger.error(f'Failed to update room info: {repr(e)}')
+            if raise_exception:
+                raise
+            return False
+        else:
+            return True
+
+    @retry(
+        retry=retry_if_exception_type(
+            (asyncio.TimeoutError, aiohttp.ClientError, ValueError)
+        ),
+        wait=wait_exponential(max=10),
+        stop=stop_after_delay(60),
+    )
+    async def get_room_info(self) -> RoomInfo:
+        try:
+            # frequent requests will be intercepted by the server's firewall!
+            room_info_data = await self._get_room_info_via_api()
+        except Exception:
+            # more cpu consumption
+            room_info_data = await self._get_room_info_via_html_page()
+        return RoomInfo.from_data(room_info_data)
+
+    @retry(
+        retry=retry_if_exception_type((asyncio.TimeoutError, aiohttp.ClientError)),
+        wait=wait_exponential(max=10),
+        stop=stop_after_delay(60),
+    )
+    async def get_user_info(self, uid: int) -> UserInfo:
+        try:
+            return await self._get_user_info_via_api(uid)
+        except Exception:
+            return await self._get_user_info_via_html_page()
 
     async def get_timestamp(self) -> int:
-        path = '/av/v1/Time/getTimestamp'
-        params = {'platform': 'pc'}
-        json_res = await self._get_json(self.base_live_api_urls, path, params=params)
-        return json_res['data']['timestamp']
+        try:
+            ts = await self.get_server_timestamp()
+        except Exception as e:
+            self._logger.warning(f'Failed to get timestamp from server: {repr(e)}')
+            ts = int(time.time())
+        return ts
 
-    async def get_user_info(self, uid: int) -> ResponseData:
-        path = '/x/space/wbi/acc/info'
-        params = {'mid': uid}
-        json_res = await self._get_json(
-            self.base_api_urls, path, with_wbi=True, params=params
+    async def get_server_timestamp(self) -> int:
+        # the timestamp on the server at the moment in seconds
+        return await self._webapi.get_timestamp()
+
+    async def get_play_infos(
+        self, qn: QualityNumber = 10000, api_platform: ApiPlatform = 'web'
+    ) -> List[Any]:
+        if api_platform == 'web':
+            play_infos = await self._webapi.get_room_play_infos(self._room_id, qn)
+        else:
+            play_infos = await self._appapi.get_room_play_infos(self._room_id, qn)
+
+        return play_infos
+
+    async def get_live_streams(
+        self, qn: QualityNumber = 10000, api_platform: ApiPlatform = 'web'
+    ) -> List[Any]:
+        play_infos = await self.get_play_infos(qn, api_platform)
+
+        for info in play_infos:
+            self._check_room_play_info(info)
+
+        return extract_streams(play_infos)
+
+    async def get_live_stream_url(
+            self,
+            qn: QualityNumber = 10000,
+            *,
+            api_platform: ApiPlatform = 'web',
+            stream_format: StreamFormat = 'flv',
+            stream_codec: StreamCodec = 'avc',
+            select_alternative: bool = False,
+    ) -> str:
+        # 计算距离上次请求已经过了多少秒
+        now = time.monotonic()
+        elapsed = now - self._last_request_time
+        if elapsed < 5:
+            time.sleep(5 - elapsed)
+
+        # 更新上次请求时间
+        self._last_request_time = time.monotonic()
+        self._logger.warning(f'调用请求函数')
+        streams = await self.get_live_streams(qn, api_platform=api_platform)
+        if not streams:
+            raise NoStreamAvailable(stream_format, stream_codec, qn)
+
+        formats = extract_formats(streams, stream_format)
+        if not formats:
+            raise NoStreamFormatAvailable(stream_format, stream_codec, qn)
+
+        if stream_format == 'fmp4':
+            def sort_by_host(info: Any) -> int:
+                if m := re.search(r'gotcha(\d+)', info['host']):
+                    n = int(m.group(1))
+                    if 201 <= n <= 208:
+                        return n
+                return 1000
+
+            # 直接遍历 formats -> 每个 format['codec'] -> 每个 codec['url_info']
+            url_infos = sorted(
+                (
+                    {**ui, 'base_url': c['base_url']}
+                    for fmt in formats
+                    for c in fmt.get('codec', [])
+                    for ui in c.get('url_info', [])
+                ),
+                key=sort_by_host,
+            )
+            urls = [i['host'] + i['base_url'] + i['extra'] for i in url_infos]
+
+            # 只有 qn==10000 时才执行过滤逻辑，过滤请求qn为10000时依然返回的其他画质链接
+            if qn == 10000:
+                # 检查不支持的质量标签，并在日志中打印这种情况下的原始请求
+                for u in urls:
+                    if any(tag in u for tag in ("_4000", "_2500", "_1500", "_800")):
+                        self._logger.debug(f"链接出现_4000/2500/1500/800，原始请求：{streams}")
+
+                # 分组：优先不含真原画，其次prohevc，再次bluray
+                exclude = ["_bluray", "_prohevc", "_hevc", "_minihevc", "_proav1", "_av1", "_miniav1"\
+,"_4000", "_2500", "_1500", "_800"]
+                pref = [u for u in urls if all(tag not in u for tag in exclude)]
+                prov = [u for u in urls if "_prohevc" in u]
+                blur = [u for u in urls if "_bluray" in u]
+                av1 = [u for u in urls if "_proav1" in u]
+
+                if pref:
+                    candidates = pref
+                elif prov:
+                    candidates = prov
+                elif blur:
+                    candidates = blur
+                elif av1:
+                    self._logger.debug(f'选中_proav1，几乎不可能的事情发生，原始请求:{streams}')
+                    candidates = av1
+                else:
+                    raise NoStreamQualityAvailable("if_fmp4内部逻辑1", stream_format, stream_codec, qn)
+
+                urls = candidates
+
+            if not urls:
+                raise NoStreamQualityAvailable("if_fmp4内部逻辑2", stream_format, stream_codec, qn)
+
+            if not select_alternative:
+                return urls[0]
+            else:
+                return urls[1]
+
+        # 非 fmp4 保持原有逻辑
+        codecs = extract_codecs(formats, stream_codec)
+        if not codecs:
+            raise NoStreamCodecAvailable(stream_format, stream_codec, qn)
+
+        def sort_by_host(info: Any) -> int:
+            host = info['host']
+            if match := re.search(r'gotcha(\d+)', host):
+                num = match.group(1)
+                if num == '04':
+                    return 0
+                if num == '09':
+                    return 1
+                if num == '08':
+                    return 2
+                if num == '05':
+                    return 3
+                if num == '07':
+                    return 4
+                return 1000 + int(num)
+            elif 'mcdn' in host:
+                return 2000
+            elif re.search(r'cn-[a-z]+-[a-z]+', host):
+                return 5000
+            else:
+                return 10000
+
+        url_infos = sorted(
+            ({**i, 'base_url': c['base_url']} for c in codecs for i in c['url_info']),
+            key=sort_by_host,
         )
-        return json_res['data']
+        urls = [i['host'] + i['base_url'] + i['extra'] for i in url_infos]
 
-    async def get_danmu_info(self, room_id: int) -> ResponseData:
-        path = '/xlive/web-room/v1/index/getDanmuInfo'
-        params = {'id': room_id}
-        json_res = await self._get_json(
-            self.base_live_api_urls, path, with_wbi=True, params=params
-        )
-        return json_res['data']
+        # 只有 qn==10000 时才执行打印逻辑，打印请求qn为10000时依然返回的其他画质链接
+        if qn == 10000:
+            # 检查不支持的质量标签，并在日志中打印这种情况下的原始请求
+            for u in urls:
+                if any(tag in u for tag in ("_4000", "_2500", "_1500", "_800")):
+                    self._logger.debug(f"链接出现_4000/2500/1500/800，原始请求：{streams}")
 
-    async def get_nav(self) -> ResponseData:
-        path = '/x/web-interface/nav'
-        json_res = await self._get_json(self.base_api_urls, path, check_response=False)
-        return json_res
+        if not select_alternative:
+            return urls[0]
 
-    async def _update_wbi_key(self) -> None:
-        nav = await self.get_nav()
-        img_key = wbi.extract_key(nav['data']['wbi_img']['img_url'])
-        sub_key = wbi.extract_key(nav['data']['wbi_img']['sub_url'])
-        self.__class__._wbi_key = wbi.make_key(img_key, sub_key)
-        self.__class__._wbi_key_mtime = time.monotonic()
+        try:
+            return urls[1]
+        except IndexError:
+            raise NoAlternativeStreamAvailable(stream_format, stream_codec, qn)
+
+    def _check_room_play_info(self, data: ResponseData) -> None:
+        if data.get('is_hidden'):
+            raise LiveRoomHidden()
+        if data.get('is_locked'):
+            raise LiveRoomLocked()
+        if data.get('encrypted') and not data.get('pwd_verified'):
+            raise LiveRoomEncrypted()
+
+    async def _get_live_status_via_api(self) -> int:
+        room_info_data = await self._get_room_info_via_api()
+        return int(room_info_data['live_status'])
+
+    async def _get_user_info_via_api(self, uid: int) -> UserInfo:
+        try:
+            data = await self._webapi.get_info_by_room(self._room_id)
+            return UserInfo.from_info_by_room(data)
+        except Exception:
+            try:
+                data = await self._appapi.get_info_by_room(self._room_id)
+                return UserInfo.from_info_by_room(data)
+            except Exception:
+                data = await self._appapi.get_user_info(uid)
+                return UserInfo.from_app_api_data(data)
+
+    async def _get_room_info_via_api(self) -> ResponseData:
+        try:
+            info_data = await self._webapi.get_info_by_room(self._room_id)
+            room_info_data = info_data['room_info']
+        except Exception:
+            try:
+                info_data = await self._appapi.get_info_by_room(self._room_id)
+                room_info_data = info_data['room_info']
+            except Exception:
+                room_info_data = await self._webapi.get_info(self._room_id)
+
+        return room_info_data
+
+    async def _get_live_status_via_html_page(self) -> int:
+        async with self._session.get(self._html_page_url) as response:
+            data = await response.read()
+
+        m = _LIVE_STATUS_PATTERN.search(data)
+        assert m is not None, data
+
+        return int(m.group(1))
+
+    async def _get_user_info_via_html_page(self) -> UserInfo:
+        info_res = await self._get_room_info_res_via_html_page()
+        return UserInfo.from_info_by_room(info_res)
+
+    async def _get_room_info_via_html_page(self) -> ResponseData:
+        info_res = await self._get_room_info_res_via_html_page()
+        return info_res['room_info']
+
+    async def _get_room_play_info_via_html_page(self) -> ResponseData:
+        return await self._get_room_init_res_via_html_page()
+
+    async def _get_room_info_res_via_html_page(self) -> ResponseData:
+        info = await self._get_info_via_html_page()
+        if info['roomInfoRes']['code'] != 0:
+            raise ValueError(f"Invaild roomInfoRes: {info['roomInfoRes']}")
+        return info['roomInfoRes']['data']
+
+    async def _get_room_init_res_via_html_page(self) -> ResponseData:
+        info = await self._get_info_via_html_page()
+        if info['roomInitRes']['code'] != 0:
+            raise ValueError(f"Invaild roomInitRes: {info['roomInitRes']}")
+        return info['roomInitRes']['data']
+
+    async def _get_info_via_html_page(self) -> ResponseData:
+        async with self._session.get(self._html_page_url) as response:
+            data = await response.read()
+
+        match = _INFO_PATTERN.search(data)
+        if not match:
+            raise ValueError('Can not extract info from html page')
+
+        string = match.group(1).decode(encoding='utf8')
+        return json.loads(string)
